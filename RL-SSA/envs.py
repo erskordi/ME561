@@ -2,6 +2,7 @@ from calendar import EPOCH
 
 import gymnasium as gym
 from gymnasium import spaces
+from gymnasium.utils.env_checker import check_env
 import numpy as np
 import pandas as pd
 
@@ -63,7 +64,8 @@ class SingleSatBaseEnv(gym.Env):
         reward = 0
         
         # Check if the episode is done (this is a placeholder for actual termination conditions)
-        truncated = terminated = self.timestep_index >= self.debug_episode_length 
+        terminated = False
+        truncated = self.timestep_index >= self.debug_episode_length
         
         info = {
             "time_utc": self.current_time,
@@ -204,8 +206,24 @@ class SingleSatEnv(SingleSatBaseEnv):
     This class is intended for actual use, while SingleSatTestEnv is for testing and debugging.
     """
 
-    def __init__(self, data, K):
+    def __init__(self, 
+                 data,
+                 rso_df,
+                 K=5,
+                 rso_pool_size=200,
+                 max_rso_age_days=30,
+                 max_obs_range_km=1000,
+                 range_norm_km=2000,
+                 rel_speed_norm_km_s=15,
+                 risk_distance_scale_km=100,):
         """
+        SingleSatEnv is a custom Gymnasium environment 
+        for simulating a single Iridium satellite and its 
+        interactions with candidate resident space objects (RSOs).
+        The interactions are expressed through the selection of RSOs 
+        for observation, and the environment provides feedback in the 
+        form of rewards based on the actions taken by the agent.
+
         The state of each candidate RSO will include:
         - relative position (3D)
         - relative velocity (3D)
@@ -217,27 +235,641 @@ class SingleSatEnv(SingleSatBaseEnv):
         - object type (encoded as an integer)
         """
         super(SingleSatEnv, self).__init__(data)
-        # K = Number of candidate resident space objects (RSOs) that can be selected for observation in the environment
+        # K = Number of candidate resident space objects (RSOs) 
+        # that can be selected for observation in the environment
         
-        # Each action corresponds to selecting one of the K RSOs or taking no action (0)
+        # Each action corresponds to selecting one of the K RSOs or 
+        # taking no action (0)
         self.K = K
+        self.rso_feature_dim = 14 # Each RSO has 14 features in the observation space
+        self.max_rso_age_days = max_rso_age_days
+        self.rso_pool_size = rso_pool_size
+        self.max_obs_range_km = max_obs_range_km
+        self.range_norm_km = range_norm_km
+        self.rel_speed_norm_km_s = rel_speed_norm_km_s
+        self.risk_distance_scale_km = risk_distance_scale_km
+
+        self.closing_speed_scale_km_s = 20.0 # km/s
+
+        # reward weights
+        self.w_risk = 1.0
+        self.w_observability = 0.4
+        self.w_staleness = 0.4
+        self.w_type = 0.15
+        self.w_missed_priority = 0.6
+        self.noop_base_penalty = 0.05
+        self.noop_priority_penalty = 0.5
+        self.retask_penalty = 0.01
+
+        self.max_time_since_obs_s = 24 * 3600  # 1 day in seconds
+        self.previous_action = 0  # Initialize previous action to 0 (no action)
+        
+        self.rso_df = self._prepare_rso_dataframe(
+            rso_df=rso_df,
+            max_age_days=self.max_rso_age_days,
+            rso_pool_size=self.rso_pool_size
+        )
+        
+        self.rso_objects = self._build_rso_objects(self.rso_df)
+        self.time_since_last_observed_s = np.full(
+            len(self.rso_objects), 
+            self.max_time_since_obs_s, 
+            dtype=np.float32
+        )
+
+        print("RSO dataframe rows after prepare:", len(self.rso_df))
+        print("RSO propagator objects:", len(self.rso_objects))
+
+        if len(self.rso_df) > 0:
+            print(self.rso_df[[
+                "NORAD_CAT_ID", 
+                "OBJECT_NAME", 
+                "OBJECT_TYPE", 
+                "EPOCH", 
+                "ALTITUDE_MEAN_KM_EST"
+            ]].head())
+
+        self.current_candidates = []
+        
         self.action_space = spaces.Discrete(self.K + 1)
 
         # The observation space includes the satellite's state and the states of K RSOs.
-        self.observation_space = spaces.Box(low=-1, high=1, shape=(12 + K * 11,), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=-1, 
+            high=1, 
+            shape=(12 + self.K * self.rso_feature_dim,), 
+            dtype=np.float32)
+    
+    def _prepare_rso_dataframe(self, 
+                               rso_df,
+                               max_age_days=30, 
+                               rso_pool_size=100):
+        """
+        Clean and reduce the background RSO DataFrame to a manageable size for the environment.
+        This includes filtering by age and sampling a subset of RSOs.
+        """
+        df = rso_df.copy()
 
-    def _reward(self, obs, action):
+        df["EPOCH_DT"] = pd.to_datetime(df["EPOCH"], 
+                                        utc=True, 
+                                        errors='coerce')
+        
+        # The propagator works only using TLE1-2 lines
+        df = df[df["TLE_LINE1"].notna() & df["TLE_LINE2"].notna()].copy()
+
+        # Exclude controlled RSOs (e.g., Iridium 33) from the background RSO DataFrame
+        controlled_id = int(self.orbital_data["cat_id"])
+        df = df[df["NORAD_CAT_ID"] != controlled_id].copy()
+
+        # Avoid very old RSOs that may have decayed or are no longer relevant
+        current_time = pd.to_datetime(self.orbital_data["epoch"], utc=True)
+        min_epoch = current_time - pd.Timedelta(days=max_age_days)
+        df = df[df["EPOCH_DT"] >= min_epoch].copy()
+
+        # Normalize missing values in the DataFrame to avoid issues during propagation
+        df.fillna({"OBJECT_TYPE": "UNKNOWN"}, inplace=True)
+
+        # Allowed object types for RSOs in the environment
+        allowed_types = ["PAYLOAD", "ROCKET BODY", "DEBRIS", "UNKNOWN"]
+        df = df[df["OBJECT_TYPE"].isin(allowed_types)].copy()
+
+        # Focus on objects at the same altitude range as the Iridium satellite (500-1200 km)
+        controlled_alt_km = float(self.orbital_data["a"]) - R_E  # Semi-major axis minus Earth's radius
+
+        if "ALTITUDE_MEAN_KM_EST" in df.columns:
+            df["ALT_DIFF_KM"] = np.abs(df["ALTITUDE_MEAN_KM_EST"] - controlled_alt_km)
+            df = df.sort_values(by="ALT_DIFF_KM")
+        elif "SEMIMAJOR_AXIS" in df.columns:
+            df["ALTITUDE_KM"] = df["SEMIMAJOR_AXIS"] - R_E
+            df["ALT_DIFF_KM"] = np.abs(df["ALTITUDE_KM"] - controlled_alt_km)
+            df = df.sort_values(by="ALT_DIFF_KM")
+
+        # Sample a subset of RSOs if the pool size is smaller than the available RSOs
+        if len(df) > rso_pool_size:
+            df = df.sample(n=rso_pool_size, random_state=42).reset_index(drop=True)
+
+        return df.reset_index(drop=True)
+    
+    def _build_rso_objects(self, rso_df):
         """
-        Calculate the reward based on the current observation and action taken.
-        This is a placeholder for actual reward logic.
+        Build a list of RSO objects from the cleaned and 
+        reduced DataFrame.
+
+        Each RSO object will contain its orbital data, propagator,
+        and other relevant information.
         """
-        reward = 0.0
+        rso_objects = []
+        for rso_idx, row in rso_df.iterrows():
+            rso_data = {
+                "local_id": rso_idx,
+                'cat_id': row['NORAD_CAT_ID'],
+                'epoch': row['EPOCH'],
+                'object_name': row['OBJECT_NAME'],
+                'object_type': row['OBJECT_TYPE'],
+                'tle_line1': row['TLE_LINE1'],
+                'tle_line2': row['TLE_LINE2'],
+                'a': row.get('SEMIMAJOR_AXIS', np.nan),  # Semi-major axis in km
+                'e': row.get('ECCENTRICITY', np.nan),  # Eccentricity
+                'i': row.get('INCLINATION', np.nan),  # Inclination in radians
+                'raan': row.get('RA_OF_ASC_NODE', np.nan),  # Right ascension of ascending node in radians
+                'argp': row.get('ARG_OF_PERICENTER', np.nan),  # Argument of perigee in radians
+                'M': row.get('MEAN_ANOMALY', np.nan),  # Mean anomaly in radians
+                "propagator": SGP4Propagator(row['TLE_LINE1'], row['TLE_LINE2'])
+            }
+            rso_objects.append(rso_data)
+        return rso_objects
+    
+    def _object_type_code(self, object_type):
+        """
+        Encode the object type as an integer code.
+        PAYLOAD: 0, ROCKET BODY: 1, DEBRIS: 2, UNKNOWN: 3
+
+        TODO: Update to one-hot encoding if needed in the future.
+        """
+        type_mapping = {
+            "PAYLOAD": 0,
+            "ROCKET BODY": 1,
+            "DEBRIS": 2,
+            "UNKNOWN": 3
+        }
+        return type_mapping.get(object_type, 3)  # Default to UNKNOWN if not found
+
+    def _propagate_rsos(self, datetime_utc):
+        """
+        Propagate all considered RSOs
+        """
+        states = []
+        num_valid = 0
+        num_failed = 0
+        first_errors = []
+
+        for obj in self.rso_objects:
+            try:
+                r_km, v_km_s = obj["propagator"].propagate(datetime_utc)
+                
+                r_km = np.asarray(r_km, dtype=np.float32)
+                v_km_s = np.asarray(v_km_s, dtype=np.float32)
+                
+                radius_km = np.linalg.norm(r_km)
+                velocity_km_s = np.linalg.norm(v_km_s)
+                altitude_km = radius_km - R_E
+
+                states.append(
+                    {
+                        "local_id": obj["local_id"],
+                        "cat_id": obj["cat_id"],
+                        "r_km": r_km,
+                        "v_km_s": v_km_s,
+                        "radius_km": radius_km,
+                        "velocity_km_s": velocity_km_s,
+                        "object_name": obj["object_name"],
+                        "object_type": obj["object_type"],
+                        "altitude_km": altitude_km,
+                        "a": obj["a"],
+                        "e": obj["e"],
+                        "i": obj["i"],
+                        "raan": obj["raan"],
+                        "argp": obj["argp"],
+                        "M": obj["M"],
+                        "valid": True,
+                        "error": None
+                    }
+                )
+
+                num_valid += 1 
+
+            except Exception as e:
+                num_failed += 1
+
+                if len(first_errors) < 5:
+                    first_errors.append({
+                        "cat_id": obj["cat_id"],
+                        "object_name": obj["object_name"],
+                        "error": str(e)
+                    })
+
+                states.append({
+                    "local_id": obj["local_id"],
+                    "cat_id": obj["cat_id"],
+                    "r_km": np.array([np.nan, np.nan, np.nan], dtype=np.float32),
+                    "v_km_s": np.array([np.nan, np.nan, np.nan], dtype=np.float32),
+                    "radius_km": np.nan,
+                    "velocity_km_s": np.nan,
+                    "object_name": obj["object_name"],
+                    "object_type": obj["object_type"],
+                    "altitude_km": np.nan,
+                    "a": obj["a"],
+                    "e": obj["e"],
+                    "i": obj["i"],
+                    "raan": obj["raan"],
+                    "argp": obj["argp"],
+                    "M": obj["M"],
+                    "valid": False,
+                    "error": str(e)
+                })
+
+        self.last_rso_propagation_debug = {
+            "num_rso_objects": len(self.rso_objects),
+            "num_valid": num_valid,
+            "num_failed": num_failed,
+            "first_errors": first_errors
+        }
+
+        return states
+    
+    def _select_candidates(self, rso_states, own_propagated):
+        """
+        Select K candidate RSOs based on proximity and other criteria.
+
+        own_propagated is the tuple returned by _propagate(), 
+        which includes the satellite's position and velocity.
+
+        Example:
+            0 = no observation
+            1 = observe nearest candidate
+            2 = observe second-nearest candidate
+            ...
+            K = observe K-th nearest candidate
+        """
+        own_r = own_propagated[0]
+        own_v = own_propagated[1]
+
+        candidates = []
+
+        for state in rso_states:
+
+            if not state["valid"]:
+                continue
+
+            # Calculate relative position and velocity
+            rel_pos = state["r_km"] - own_r
+            rel_vel = state["v_km_s"] - own_v
+            range_km = np.linalg.norm(rel_pos)
+            rel_speed_km_s = np.linalg.norm(rel_vel)
+
+            visible = 1 if range_km <= self.max_obs_range_km else 0
+
+            risk_score = np.exp(
+                -0.5 * (range_km / self.risk_distance_scale_km) ** 2
+            )
+
+            # relative motion terms for risk scoring and normalize
+            #  closing_rate_km_s > 0  → RSO is approaching the controlled satellite
+            #  closing_rate_km_s < 0  → RSO is moving away
+            closing_rate_km_s = -np.dot(rel_pos, rel_vel) / (range_km + 1e-9)
+
+            closing_score = np.clip(
+                closing_rate_km_s / self.closing_speed_scale_km_s, 
+                0, 
+                1
+            )
+
+            range_score = np.exp(
+                - 0.5 * (range_km / self.risk_distance_scale_km) ** 2
+            )
+            
+            # Makes risk score more sensitive to closing speed, while still considering range
+            risk_score = range_score * (0.7 * closing_score + 0.3)
+            risk_score = np.clip(risk_score, 0, 1)
+
+            local_id = state["local_id"]
+            time_since_last_obs = np.clip(
+                self.time_since_last_observed_s[local_id] / self.max_time_since_obs_s, 
+                0, 
+                1
+            )
+
+            object_type_code = self._object_type_code(state["object_type"])
+
+            observability = np.exp(
+                - 0.5 * (range_km / self.max_obs_range_km) ** 2
+                )
+
+            feature = np.array([
+                rel_pos[0] / self.range_norm_km,
+                rel_pos[1] / self.range_norm_km,
+                rel_pos[2] / self.range_norm_km,
+                rel_vel[0] / self.rel_speed_norm_km_s,
+                rel_vel[1] / self.rel_speed_norm_km_s,
+                rel_vel[2] / self.rel_speed_norm_km_s,
+                range_km / self.range_norm_km,
+                rel_speed_km_s / self.rel_speed_norm_km_s,
+                closing_rate_km_s / self.closing_speed_scale_km_s,
+                visible,
+                observability,
+                risk_score,
+                time_since_last_obs,
+                object_type_code
+            ], dtype=np.float32)
+            
+            feature = np.clip(feature, -1, 1)
+
+            candidates.append({
+                "local_id": local_id,
+                "cat_id": state["cat_id"],
+                "object_name": state["object_name"],
+                "object_type": state["object_type"],
+                "state_km":rel_pos,
+                "state_km_s": rel_vel,
+                "feature": feature,
+                "range_km": range_km,
+                "rel_speed_km_s": rel_speed_km_s,
+                "closing_rate_km_s": closing_rate_km_s,
+                "visible": bool(visible),
+                "observability": observability,
+                "risk_score": risk_score,
+                "time_since_last_obs": time_since_last_obs,
+                "object_type_code": object_type_code,
+                "valid": True
+            })
+        
+        for c in candidates:
+            c["priority"] = self._candidate_priority(c)
+
+        # Focus on nearest RSOs based on priority 
+        candidates = sorted(
+            candidates, 
+            key=lambda x: x["priority"], 
+            reverse=True)
+        candidates = candidates[:self.K]
+        #print("Number of candidates selected:", len(candidates))
+
+        # Pad if fewer than K candidates are available
+        while len(candidates) < self.K:
+            candidates.append({
+                "local_id": -1,
+                "cat_id": -1,
+                "object_name": "NONE",
+                "object_type": "NONE",
+                "state_km": np.array([0.0, 0.0, 0.0]),
+                "state_km_s": np.array([0.0, 0.0, 0.0]),
+                "feature": np.zeros(self.rso_feature_dim, dtype=np.float32),
+                "range_km": np.inf,
+                "rel_speed_km_s": np.inf,
+                "closing_rate_km_s": 0.0,
+                "visible": False,
+                "observability": 0.0,
+                "risk_score": 0.0,
+                "time_since_last_obs": 1.0,
+                "object_type_code": -1,
+                "valid": False
+            })
+
+        return candidates
+    
+    def _build_observation_with_candidates(self, own_propagated, candidates):
+        """
+        Expands upon _build_observation to include the states of K RSOs in the observation vector.
+
+        Build the observation vector including the satellite's state 
+        and the states of K RSOs.
+        """
+        own_obs = self._build_observation(own_propagated)
+
+        rso_features = np.array([c["feature"] for c in candidates], dtype=np.float32)
+        rso_features_flat = rso_features.flatten()
+
+        full_obs = np.concatenate([own_obs, rso_features_flat])
+        full_obs = np.clip(full_obs, -1, 1)
+
+        return full_obs.astype(np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+
+        self.timestep_index = 0
+        self.current_time = pd.to_datetime(self.orbital_data["epoch"], utc=True)
+
+        self.time_since_last_observed_s[:] = self.max_time_since_obs_s
+        self.previous_action = 0
+
+        propagated = self._propagate(self.current_time)
+        rso_states = self._propagate_rsos(self.current_time)
+        candidates = self._select_candidates(rso_states, propagated)
+
+        self.current_candidates = candidates
+
+        obs = self._build_observation_with_candidates(propagated, candidates)
+
+        info = {
+            "time_utc": self.current_time,
+            "num_rso_objects": len(self.rso_objects),
+            "candidate_cat_ids": [c["cat_id"] for c in candidates],
+            "candidate_ranges_km": [float(c["range_km"]) for c in candidates],
+            "candidate_names": [c["object_name"] for c in candidates],
+            "candidate_types": [c["object_type"] for c in candidates],
+            "candidate_visible": [bool(c["visible"]) for c in candidates],
+            "candidate_risk_scores": [float(c["risk_score"]) for c in candidates],
+            "candidate_time_since_last_obs": [float(c["time_since_last_obs"]) for c in candidates],
+            "candidate_observability": [float(c["observability"]) for c in candidates],
+        }
+
+        return obs.astype(np.float32), info
+    
+    def step(self, action):
+        self.timestep_index += 1
+        self.current_time += pd.to_timedelta(self.timestep, unit='s')
+
+        # Every object is propagated at each timestep, and the candidates are selected based on the current state of the satellite and the RSOs.
+        self.time_since_last_observed_s += self.timestep  # Increment time since last observed for all RSOs
+        self.time_since_last_observed_s = np.clip(
+            self.time_since_last_observed_s, 
+            0, 
+            self.max_time_since_obs_s)
+
+        # Propagate controlled satellite and RSOs, then select candidates for observation
+        propagated = self._propagate(self.current_time)
+        rso_states = self._propagate_rsos(self.current_time)
+        print("RSO propagation debug info:", self.last_rso_propagation_debug)
+
+        # Select K candidate RSOs based on proximity and other criteria
+        candidates = self._select_candidates(rso_states, propagated)
+        self.current_candidates = candidates
+
+        num_validate_candidates = sum(c["valid"] for c in candidates)
+        finite_ranges = [
+            float(c["range_km"]) for c in candidates 
+            if np.isfinite(c["range_km"])
+        ]
+
+        print("Candidate debug:")
+        print(" total candidates returned:", len(candidates))
+        print(" number of valid candidates:", num_validate_candidates)
+        print(" finite ranges:", finite_ranges)
+        print(" candidate names:", [c["object_name"] for c in candidates])
+        print(" candidate closing rates:", [c["closing_rate_km_s"] for c in candidates])
+
+        # Compute reward based on the selected action and the candidates
+        reward = self._reward(action, candidates)
+
+        # If the action corresponds to observing a valid and visible RSO, 
+        # reset its time since last observed
+        #  visible = diagnostic hard flag
+        #  observability = reward-relevant soft visibility
+        if action > 0:
+            selected_rso = candidates[action - 1]
+            
+            if selected_rso["valid"] and selected_rso["observability"] > 0.1:
+                local_id = selected_rso["local_id"]
+                self.time_since_last_observed_s[local_id] = 0.0  # Reset time since last observed for the selected RSO
+
+        obs = self._build_observation_with_candidates(propagated, candidates)
+
+        terminated = False
+        truncated = self.timestep_index >= self.true_episode_length
+
+        info = {
+            "time_utc": self.current_time,
+            "num_rso_objects": len(self.rso_objects),
+            "candidate_cat_ids": [c["cat_id"] for c in candidates],
+            "candidate_ranges_km": [float(c["range_km"]) for c in candidates],
+            "candidate_names": [c["object_name"] for c in candidates],
+            "candidate_types": [c["object_type"] for c in candidates],
+            "candidate_visible": [bool(c["visible"]) for c in candidates],
+            "candidate_risk_scores": [float(c["risk_score"]) for c in candidates],
+            "candidate_time_since_last_obs": [float(c["time_since_last_obs"]) for c in candidates],
+            "selected_action": action,
+            "selected_cat_id": candidates[action - 1]["cat_id"] if action > 0 else None,
+            "selected_object_name": candidates[action - 1]["object_name"] if action > 0 else None,
+            "selected_object_type": candidates[action - 1]["object_type"] if action > 0 else None,
+            "selected_visible": bool(candidates[action - 1]["visible"]) if action > 0 else None,
+            "selected_risk_score": float(candidates[action - 1]["risk_score"]) if action > 0 else None,
+            "selected_time_since_last_obs": float(candidates[action - 1]["time_since_last_obs"]) if action > 0 else None,
+            "selected_observability": float(candidates[action - 1]["observability"]) if action > 0 else None,
+            "selected_priority": self._candidate_priority(candidates[action - 1]) if action > 0 else 0.0,
+            "max_priority": max(self._candidate_priority(c) for c in candidates) if candidates else 0.0,
+            "priority_regret": max(self._candidate_priority(c) for c in candidates) - self._candidate_priority(candidates[action - 1]) if action > 0 else 0.0,
+            "num_valid_candidates": num_validate_candidates,       
+        }
+
+        self.previous_action = action
+
+        print("Reward check:")
+        for a in range(self.action_space.n):
+            r_test = self._reward(a, candidates)
+
+            if a == 0:
+                name = "No Observation"
+                priority = None
+            else:
+                c = candidates[a - 1]
+                name = c["object_name"]
+                priority = self._candidate_priority(c)
+
+            if priority is None:
+                print(f" action {a} ({name:20s}): reward = {r_test:.3f}")
+            else:
+                print(
+                    f" action {a} ({name:20s}): "
+                    f"reward = {r_test:.3f}, "
+                    f"priority = {priority:.3f}, "
+                    f"risk = {c['risk_score']:.3f}, "
+                    f"obs = {c['observability']:.3f}, "
+                    f"stale = {c['time_since_last_obs']:.3f}"
+                )
+
+        return obs.astype(np.float32), reward, terminated, truncated, info
+
+    def _type_priority(self, object_type):
+        object_type = str(object_type).upper()
+
+        if object_type == "DEBRIS":
+            return 1.0  # Highest priority for debris
+        elif object_type == "ROCKET BODY":
+            return 0.8  # Medium priority for rocket bodies
+        elif object_type == "PAYLOAD":
+            return 0.5  # Lower priority for payloads
+        elif object_type == "UNKNOWN":
+            return 0.6  # Lowest priority for unknown types
+        else:
+            return 0.4  # Default priority for unrecognized types
+    
+    def _candidate_priority(self, candidate):
+        """
+        Instead of an artificial rank reward, we have a priority score based on risk, observability, and staleness.
+        
+        Priority combines:
+        - geometric risk score (based on range and closing speed)
+        - observability score (how easy it is to observe the RSO)
+        - time since last observation (to encourage observing RSOs that haven't been observed recently)
+        - object type priority (to encourage observing certain types of RSOs)
+        
+        This way, each candidate is rewarded based on its intrinsic properties rather than its rank among the candidates.
+        """
+
+        risk_score_term = candidate["risk_score"]
+        observability_term = candidate["observability"]
+        time_since_last_obs_term = candidate["time_since_last_obs"]
+        object_type_priority_term = self._type_priority(candidate["object_type"])
+
+        priority = (
+            self.w_risk * risk_score_term +
+            self.w_observability * observability_term +
+            self.w_staleness * time_since_last_obs_term +
+            self.w_type * object_type_priority_term
+        )
+
+        return priority
+
+    def _reward(self, action, candidates):
+        """
+        Reward the agent for selecting useful nearby RSOs
+
+        Action:
+            0 = no observation
+            1..K = observe candidate[K - 1]
+        """
+        valid_candidates = [c for c in candidates if c["valid"]]
+
+        if len(valid_candidates) == 0:
+            # No valid candidates, reward is zero
+            # Penalty for selecting an invalid RSO
+            return 0.0 if action == 0 else -1.0  
+
+        priorities = [
+            self._candidate_priority(c)
+            for c in candidates
+            if c["visible"] and c["valid"]
+        ]
+        max_priority = max(priorities) if priorities else 0.0
 
         if action == 0:
-            reward -= 1  # Penalty for taking no action
-        else:
-            
-    
+            # Penalty for not observing when there are visible RSOs
+            return (
+                -self.noop_priority_penalty * max_priority 
+                - self.noop_base_penalty
+            )
+
+        selected = candidates[action - 1]
+
+        if not selected["valid"]: # or not selected["visible"]
+            return -1.0  # Penalty for selecting an invalid or non-visible RSO
+        
+        selected_priority = self._candidate_priority(selected)
+
+        # Missed priority penalty: if the selected RSO has lower priority
+        # than the highest priority visible RSO
+        missed_priority_penalty = self.w_missed_priority * max(
+            0, 
+            max_priority - selected_priority
+        )
+
+        # Retasking penalty: if the selected RSO is different from the previous action
+        retask_penalty = (
+            self.retask_penalty 
+            if action != self.previous_action 
+            else 0.0
+        )
+
+        # Weak penalty for extremely low observability
+        low_observability_penalty = 0.0
+        if selected["observability"] < 0.1:
+            low_observability_penalty = 0.1 * (0.1 - selected["observability"])
+
+        reward = selected_priority - missed_priority_penalty - retask_penalty - low_observability_penalty
+
+        self.previous_action = action
+        return float(reward)
 
 if __name__ == "__main__":
     # Example usage of the IridiumSingleSatEnv
@@ -245,7 +877,17 @@ if __name__ == "__main__":
     df = pd.read_csv('/home/erskordi/Documents/UNM-files/Summer26/ME561/Project/2026-06-20/ssa_data_audit_outputs/candidate_controlled_iridium_records.csv')
     df_clean = data_preprocess(df=df)
 
-    mode = "debug"  # Change to "true" for the actual environment
+    # Load other RSOs
+    df_other = pd.read_csv('/home/erskordi/Documents/UNM-files/Summer26/ME561/Project/2026-06-20/ssa_data_audit_outputs/candidate_background_leo_500_1200_latest.csv')
+    df_other_clean = df_other[df_other['NORAD_CAT_ID'] != 24946]  # Exclude Iridium 33 from other RSOs
+    df.drop_duplicates(subset=["NORAD_CAT_ID"], inplace=True, keep='last')
+    df_other_clean.dropna(subset=["TLE_LINE1", "TLE_LINE2"], inplace=True)
+    df_other_clean.reset_index(drop=True, inplace=True)
+    # Sample K unique RSOs from the cleaned other RSOs DataFrame
+    K = 100  # Number of RSOs to sample
+    sampled_rso = df_other_clean.sample(n=K)
+
+    mode = input("Enter mode (debug/true/none): ")  # Change to "true" for the actual environment
 
     # Debugging example using the latest available element set for Iridium 33 satellite
     iridium33 = df_clean[
@@ -271,17 +913,52 @@ if __name__ == "__main__":
     
     if mode == "debug":
         env = SingleSatBaseEnv(orbital_data)
-    else:
-        env = SingleSatEnv(orbital_data, K=5)  # Example with K=5
-    obs = env.reset()
-    print("Initial Observation:", obs)
+    elif mode == "true":
+        env = SingleSatEnv(
+            data=orbital_data, 
+            rso_df=sampled_rso,
+            K=5,
+            rso_pool_size=200,
+            max_rso_age_days=30,
+            max_obs_range_km=1000,
+            range_norm_km=8000, #observed candidate ranges reach about 7309 km
+            rel_speed_norm_km_s=15,
+            risk_distance_scale_km=2500
+        )
+        check_env(env, skip_render_check=True)
 
-    for _ in range(10):
-        action = env.action_space.sample()  # Sample a random action (for demonstration)
-        obs, reward, terminated, truncated, info = env.step(action)
-        print("Observation:", obs)
-        print("Reward:", reward)
-        print("Info:", info)
-        if terminated or truncated:
-            break
-    """"""
+        obs_values = []
+
+        obs, info = env.reset()
+        obs_values.append(obs)
+        print("Initial Observation:", obs)
+        print("Initial candidates:", info["candidate_names"])
+        print("Initial candidate ranges (km):", info["candidate_ranges_km"])
+
+        assert obs.shape == env.observation_space.shape, "Observation shape mismatch with observation space."
+        assert env.action_space.n == env.K + 1, "Action space size mismatch. Expected 6 actions (0-5)."
+
+        for _ in range(300):
+            action = env.action_space.sample()  # Sample a random action (for demonstration)
+            obs, reward, terminated, truncated, info = env.step(action)
+            print("time:", info["time_utc"])
+            print("ranges:", np.round(info["candidate_ranges_km"], 1))
+            print("visible:", info["candidate_visible"])
+            print("risk:", np.round(info["candidate_risk_scores"], 6))
+            print("reward:", reward)
+            print("action:", action)
+            print("Observation:", obs)
+            print("Selected candidate:", info["selected_object_name"])
+            obs_values.append(obs)
+
+            if terminated or truncated:
+                break
+        
+        obs_values = np.array(obs_values)
+
+        print("obs min:", np.min(obs_values, axis=0))
+        print("obs max:", np.max(obs_values, axis=0))
+        print("fraction clipped at +1:", np.mean(obs_values >= 0.999))
+        print("fraction clipped at -1:", np.mean(obs_values <= -0.999))
+    else:
+        print("Goodbye!")
