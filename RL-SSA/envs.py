@@ -3,8 +3,11 @@ from calendar import EPOCH
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.utils.env_checker import check_env
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+import imageio.v2 as imageio
 
 from sgp4_module import SGP4Propagator
 from help_functions import data_preprocess
@@ -206,16 +209,13 @@ class SingleSatEnv(SingleSatBaseEnv):
     This class is intended for actual use, while SingleSatTestEnv is for testing and debugging.
     """
 
+    metadata = {
+        "render_modes": ["human", "rgb_array", "ansi"],
+        "render_fps": 4,
+    }
+
     def __init__(self, 
-                 data,
-                 rso_df,
-                 K=5,
-                 rso_pool_size=200,
-                 max_rso_age_days=30,
-                 max_obs_range_km=1000,
-                 range_norm_km=2000,
-                 rel_speed_norm_km_s=15,
-                 risk_distance_scale_km=100,):
+                 config):
         """
         SingleSatEnv is a custom Gymnasium environment 
         for simulating a single Iridium satellite and its 
@@ -234,20 +234,21 @@ class SingleSatEnv(SingleSatBaseEnv):
         - time since last observed
         - object type (encoded as an integer)
         """
-        super(SingleSatEnv, self).__init__(data)
+        super(SingleSatEnv, self).__init__(config["data"])
         # K = Number of candidate resident space objects (RSOs) 
         # that can be selected for observation in the environment
         
         # Each action corresponds to selecting one of the K RSOs or 
         # taking no action (0)
-        self.K = K
+        self.config = config
+        self.K = config["K"]
         self.rso_feature_dim = 14 # Each RSO has 14 features in the observation space
-        self.max_rso_age_days = max_rso_age_days
-        self.rso_pool_size = rso_pool_size
-        self.max_obs_range_km = max_obs_range_km
-        self.range_norm_km = range_norm_km
-        self.rel_speed_norm_km_s = rel_speed_norm_km_s
-        self.risk_distance_scale_km = risk_distance_scale_km
+        self.max_rso_age_days = config["max_rso_age_days"]
+        self.rso_pool_size = config["rso_pool_size"]
+        self.max_obs_range_km = config["max_obs_range_km"]
+        self.range_norm_km = config["range_norm_km"]
+        self.rel_speed_norm_km_s = config["rel_speed_norm_km_s"]
+        self.risk_distance_scale_km = config["risk_distance_scale_km"]
 
         self.closing_speed_scale_km_s = 20.0 # km/s
 
@@ -265,7 +266,7 @@ class SingleSatEnv(SingleSatBaseEnv):
         self.previous_action = 0  # Initialize previous action to 0 (no action)
         
         self.rso_df = self._prepare_rso_dataframe(
-            rso_df=rso_df,
+            rso_df=config["rso_df"],
             max_age_days=self.max_rso_age_days,
             rso_pool_size=self.rso_pool_size
         )
@@ -277,18 +278,6 @@ class SingleSatEnv(SingleSatBaseEnv):
             dtype=np.float32
         )
 
-        print("RSO dataframe rows after prepare:", len(self.rso_df))
-        print("RSO propagator objects:", len(self.rso_objects))
-
-        if len(self.rso_df) > 0:
-            print(self.rso_df[[
-                "NORAD_CAT_ID", 
-                "OBJECT_NAME", 
-                "OBJECT_TYPE", 
-                "EPOCH", 
-                "ALTITUDE_MEAN_KM_EST"
-            ]].head())
-
         self.current_candidates = []
         
         self.action_space = spaces.Discrete(self.K + 1)
@@ -299,6 +288,22 @@ class SingleSatEnv(SingleSatBaseEnv):
             high=1, 
             shape=(12 + self.K * self.rso_feature_dim,), 
             dtype=np.float32)
+        
+        self.last_own_propagated = None
+        self.last_candidates = None
+        self.last_action = None
+        self.last_reward = None
+        self.last_selected_rso = None
+
+        self._fig = None
+        self._ax = None
+
+        self.render_mode = config.get("render_mode", None)
+
+        assert self.render_mode is None or self.render_mode in self.metadata["render_modes"], \
+            f"Invalid render_mode: {self.render_mode}"
+
+        self.debug = False
     
     def _prepare_rso_dataframe(self, 
                                rso_df,
@@ -649,6 +654,12 @@ class SingleSatEnv(SingleSatBaseEnv):
 
         self.current_candidates = candidates
 
+        self.last_own_propagated = propagated
+        self.last_candidates = candidates
+        self.last_action = None
+        self.last_reward = None
+        self.last_selected_rso = None
+
         obs = self._build_observation_with_candidates(propagated, candidates)
 
         info = {
@@ -680,7 +691,6 @@ class SingleSatEnv(SingleSatBaseEnv):
         # Propagate controlled satellite and RSOs, then select candidates for observation
         propagated = self._propagate(self.current_time)
         rso_states = self._propagate_rsos(self.current_time)
-        print("RSO propagation debug info:", self.last_rso_propagation_debug)
 
         # Select K candidate RSOs based on proximity and other criteria
         candidates = self._select_candidates(rso_states, propagated)
@@ -691,13 +701,6 @@ class SingleSatEnv(SingleSatBaseEnv):
             float(c["range_km"]) for c in candidates 
             if np.isfinite(c["range_km"])
         ]
-
-        print("Candidate debug:")
-        print(" total candidates returned:", len(candidates))
-        print(" number of valid candidates:", num_validate_candidates)
-        print(" finite ranges:", finite_ranges)
-        print(" candidate names:", [c["object_name"] for c in candidates])
-        print(" candidate closing rates:", [c["closing_rate_km_s"] for c in candidates])
 
         # Compute reward based on the selected action and the candidates
         reward = self._reward(action, candidates)
@@ -718,6 +721,66 @@ class SingleSatEnv(SingleSatBaseEnv):
         terminated = False
         truncated = self.timestep_index >= self.true_episode_length
 
+        self.last_own_propagated = propagated
+        self.last_candidates = candidates
+        self.last_action = action
+        self.last_reward = reward
+        self.last_selected_rso = candidates[action - 1] if action > 0 else None
+
+        info = self._build_info(action, reward, candidates, self.last_selected_rso)
+
+        self.previous_action = action
+
+        if self.debug:
+            print("Reward check:")
+            for a in range(self.action_space.n):
+                r_test = self._reward(a, candidates)
+
+                if a == 0:
+                    name = "No Observation"
+                    priority = None
+                else:
+                    c = candidates[a - 1]
+                    name = c["object_name"]
+                    priority = self._candidate_priority(c)
+
+                if priority is None:
+                    print(f" action {a} ({name:20s}): reward = {r_test:.3f}")
+                else:
+                    print(
+                        f" action {a} ({name:20s}): "
+                        f"reward = {r_test:.3f}, "
+                        f"priority = {priority:.3f}, "
+                        f"risk = {c['risk_score']:.3f}, "
+                        f"obs = {c['observability']:.3f}, "
+                        f"stale = {c['time_since_last_obs']:.3f}"
+                    )
+
+        return obs.astype(np.float32), reward, terminated, truncated, info
+
+    def _build_info(self, action, reward, candidates, selected_rso=None):
+        """
+        Build the info dictionary for the current step.
+        """
+        selected_cat_id = -1
+        selected_object_name = ""
+        selected_object_type = ""
+        selected_visible = False
+        selected_risk_score = 0.0
+        selected_time_since_last_obs = 0.0
+        selected_observability = 0.0
+        selected_priority = 0.0
+
+        if selected_rso is not None:
+            selected_cat_id = int(selected_rso.get("cat_id", -1))
+            selected_object_name = str(selected_rso.get("object_name", ""))
+            selected_object_type = str(selected_rso.get("object_type", ""))
+            selected_visible = bool(selected_rso.get("visible", False))
+            selected_risk_score = float(selected_rso.get("risk_score", 0.0))
+            selected_time_since_last_obs = float(selected_rso.get("time_since_last_obs", 0.0))
+            selected_observability = float(selected_rso.get("observability", 0.0))
+            selected_priority = float(self._candidate_priority(selected_rso))
+
         info = {
             "time_utc": self.current_time,
             "num_rso_objects": len(self.rso_objects),
@@ -729,46 +792,19 @@ class SingleSatEnv(SingleSatBaseEnv):
             "candidate_risk_scores": [float(c["risk_score"]) for c in candidates],
             "candidate_time_since_last_obs": [float(c["time_since_last_obs"]) for c in candidates],
             "selected_action": action,
-            "selected_cat_id": candidates[action - 1]["cat_id"] if action > 0 else None,
-            "selected_object_name": candidates[action - 1]["object_name"] if action > 0 else None,
-            "selected_object_type": candidates[action - 1]["object_type"] if action > 0 else None,
-            "selected_visible": bool(candidates[action - 1]["visible"]) if action > 0 else None,
-            "selected_risk_score": float(candidates[action - 1]["risk_score"]) if action > 0 else None,
-            "selected_time_since_last_obs": float(candidates[action - 1]["time_since_last_obs"]) if action > 0 else None,
-            "selected_observability": float(candidates[action - 1]["observability"]) if action > 0 else None,
-            "selected_priority": self._candidate_priority(candidates[action - 1]) if action > 0 else 0.0,
+            "reward": reward,
+            "selected_cat_id": selected_cat_id,
+            "selected_object_name": selected_object_name,
+            "selected_object_type": selected_object_type,
+            "selected_visible": selected_visible,
+            "selected_risk_score": selected_risk_score,
+            "selected_time_since_last_obs": selected_time_since_last_obs,
+            "selected_observability": selected_observability,
+            "selected_priority": selected_priority,
             "max_priority": max(self._candidate_priority(c) for c in candidates) if candidates else 0.0,
-            "priority_regret": max(self._candidate_priority(c) for c in candidates) - self._candidate_priority(candidates[action - 1]) if action > 0 else 0.0,
-            "num_valid_candidates": num_validate_candidates,       
+            "priority_regret": max(self._candidate_priority(c) for c in candidates) - selected_priority if selected_rso else 0.0,
         }
-
-        self.previous_action = action
-
-        print("Reward check:")
-        for a in range(self.action_space.n):
-            r_test = self._reward(a, candidates)
-
-            if a == 0:
-                name = "No Observation"
-                priority = None
-            else:
-                c = candidates[a - 1]
-                name = c["object_name"]
-                priority = self._candidate_priority(c)
-
-            if priority is None:
-                print(f" action {a} ({name:20s}): reward = {r_test:.3f}")
-            else:
-                print(
-                    f" action {a} ({name:20s}): "
-                    f"reward = {r_test:.3f}, "
-                    f"priority = {priority:.3f}, "
-                    f"risk = {c['risk_score']:.3f}, "
-                    f"obs = {c['observability']:.3f}, "
-                    f"stale = {c['time_since_last_obs']:.3f}"
-                )
-
-        return obs.astype(np.float32), reward, terminated, truncated, info
+        return info
 
     def _type_priority(self, object_type):
         object_type = str(object_type).upper()
@@ -797,10 +833,19 @@ class SingleSatEnv(SingleSatBaseEnv):
         This way, each candidate is rewarded based on its intrinsic properties rather than its rank among the candidates.
         """
 
-        risk_score_term = candidate["risk_score"]
-        observability_term = candidate["observability"]
-        time_since_last_obs_term = candidate["time_since_last_obs"]
+        risk_score_term = float(candidate["risk_score"])
+        observability_term = float(candidate["observability"])
+        time_since_last_obs_term = float(candidate["time_since_last_obs"])
         object_type_priority_term = self._type_priority(candidate["object_type"])
+
+        if not np.isfinite(risk_score_term):
+            risk_score_term = 0.0
+        if not np.isfinite(observability_term):
+            observability_term = 0.0
+        if not np.isfinite(time_since_last_obs_term):
+            time_since_last_obs_term = 0.0
+        if not np.isfinite(object_type_priority_term):
+            object_type_priority_term = 0.0
 
         priority = (
             self.w_risk * risk_score_term +
@@ -809,7 +854,10 @@ class SingleSatEnv(SingleSatBaseEnv):
             self.w_type * object_type_priority_term
         )
 
-        return priority
+        if not np.isfinite(priority):
+            return 0.0
+
+        return float(priority)
 
     def _reward(self, action, candidates):
         """
@@ -832,6 +880,8 @@ class SingleSatEnv(SingleSatBaseEnv):
             if c["visible"] and c["valid"]
         ]
         max_priority = max(priorities) if priorities else 0.0
+        if not np.isfinite(max_priority):
+            max_priority = 0.0
 
         if action == 0:
             # Penalty for not observing when there are visible RSOs
@@ -846,6 +896,8 @@ class SingleSatEnv(SingleSatBaseEnv):
             return -1.0  # Penalty for selecting an invalid or non-visible RSO
         
         selected_priority = self._candidate_priority(selected)
+        if not np.isfinite(selected_priority):
+            selected_priority = 0.0
 
         # Missed priority penalty: if the selected RSO has lower priority
         # than the highest priority visible RSO
@@ -863,13 +915,162 @@ class SingleSatEnv(SingleSatBaseEnv):
 
         # Weak penalty for extremely low observability
         low_observability_penalty = 0.0
-        if selected["observability"] < 0.1:
-            low_observability_penalty = 0.1 * (0.1 - selected["observability"])
+        selected_observability = float(selected["observability"])
+        if not np.isfinite(selected_observability):
+            selected_observability = 0.0
+
+        if selected_observability < 0.1:
+            low_observability_penalty = 0.1 * (0.1 - selected_observability)
 
         reward = selected_priority - missed_priority_penalty - retask_penalty - low_observability_penalty
 
+        if not np.isfinite(reward):
+            reward = 0.0
+
         self.previous_action = action
         return float(reward)
+    
+    def render(self):
+        if self.render_mode is None:
+            return None
+        
+        if self.last_candidates is None:
+            return None
+        
+        if self.render_mode == "ansi":
+            return self._render_ansi()
+        
+        if self.render_mode in ["human", "rgb_array"]:
+            return self._render_plot()
+    
+    def _render_ansi(self):
+        """
+        Render the environment in ANSI mode (text-based).
+        """
+        lines = []
+        lines.append("=" * 40)
+        lines.append("Baseline rendering")
+        lines.append(f"Time: {self.current_time}")
+        lines.append(f"Timestep: {self.timestep_index}")
+        lines.append(f"Action taken: {self.last_action}")
+        lines.append(f"Reward received: {self.last_reward}")
+        lines.append("Candidates:")
+        
+        for idx, c in enumerate(self.last_candidates):
+            lines.append(
+                f"  [{idx}] {c['object_name']} | "
+                f"Range: {c['range_km']:.2f} km | "
+                f"Rel Speed: {c['rel_speed_km_s']:.2f} km/s | "
+                f"Risk: {c['risk_score']:.3f} | "
+                f"Obs: {c['observability']:.3f} | "
+                f"Stale: {c['time_since_last_obs']:.3f} | "
+                f"Type: {c['object_type']} | "
+                f"Valid: {c['valid']}"
+            )
+        
+        return "\n".join(lines)
+    
+    def _render_plot(self):
+        candidates = self.last_candidates
+
+        if self._fig is None or self._ax is None:
+            self._fig, self._ax = plt.subplots(figsize=(7, 7))
+
+        ax = self._ax
+        ax.clear()
+
+        # Controlled satellite at relative origin.
+        ax.scatter(0.0, 0.0, s=120, marker="*", label=f"{self.config['data']['object_name']} (Controlled)", color="blue")
+
+        xs = []
+        ys = []
+        labels = []
+        priorities = []
+        sizes = []
+
+        for i, c in enumerate(candidates, start=1):
+            if not c["valid"]:
+                continue
+
+            dr = np.asarray(c["state_km"], dtype=float)
+
+            xs.append(dr[0])
+            ys.append(dr[1])
+            labels.append(f"{i}: {c['object_name']}")
+            priorities.append(self._candidate_priority(c))
+
+            # Larger marker for higher-priority candidates.
+            sizes.append(40.0 + 160.0 * float(self._candidate_priority(c)))
+
+        xs = np.array(xs)
+        ys = np.array(ys)
+
+        if len(xs) > 0:
+            sc = ax.scatter(xs, ys, s=sizes)
+
+            for x, y, label in zip(xs, ys, labels):
+                ax.text(x, y, label, fontsize=8)
+
+        # Draw candidate observation range circle if available.
+        if hasattr(self, "max_obs_range_km"):
+            circle = plt.Circle(
+                (0.0, 0.0),
+                self.max_obs_range_km,
+                fill=False,
+                linestyle="--",
+                linewidth=1.0,
+            )
+            ax.add_patch(circle)
+
+        # Axis limits.
+        max_extent = self.max_obs_range_km
+
+        if len(xs) > 0:
+            max_candidate_extent = float(
+                max(np.max(np.abs(xs)), np.max(np.abs(ys)), self.max_obs_range_km)
+            )
+            max_extent = 1.1 * max_candidate_extent
+
+        ax.set_xlim(-max_extent, max_extent)
+        ax.set_ylim(-max_extent, max_extent)
+        ax.set_aspect("equal", adjustable="box")
+
+        ax.set_xlabel("Relative x position [km]")
+        ax.set_ylabel("Relative y position [km]")
+
+        title = f"SingleSatSSAEnv | step={self.timestep_index}"
+
+        if self.last_action is not None:
+            title += f" | action={self.last_action}"
+
+        if self.last_reward is not None:
+            title += f" | reward={self.last_reward:.3f}"
+
+        ax.set_title(title)
+        ax.grid(True)
+        ax.legend(loc="upper right")
+
+        self._fig.tight_layout()
+
+        if self.render_mode == "human":
+            plt.pause(0.001)
+            return None
+
+        if self.render_mode == "rgb_array":
+            self._fig.canvas.draw()
+
+            width, height = self._fig.canvas.get_width_height()
+            image = np.frombuffer(self._fig.canvas.tostring_argb(), dtype=np.uint8)
+            image = image.reshape((height, width, 4))
+            image = image[:, :, [1, 2, 3]]  # Convert ARGB to RGB
+
+            return image
+    
+    def close(self):
+        if self._fig is not None:
+            plt.close(self._fig)
+            self._fig = None
+            self._ax = None
 
 if __name__ == "__main__":
     # Example usage of the IridiumSingleSatEnv
@@ -914,51 +1115,48 @@ if __name__ == "__main__":
     if mode == "debug":
         env = SingleSatBaseEnv(orbital_data)
     elif mode == "true":
+        env_config = {
+            "data": orbital_data,
+            "rso_df": sampled_rso,
+            "K": 5,
+            "rso_pool_size": 200,
+            "max_rso_age_days": 30,
+            "max_obs_range_km": 1000,
+            "range_norm_km": 8000,  # observed candidate ranges reach about 7309 km
+            "rel_speed_norm_km_s": 15,
+            "risk_distance_scale_km": 2500,
+            "render_mode": "rgb_array",}
         env = SingleSatEnv(
-            data=orbital_data, 
-            rso_df=sampled_rso,
-            K=5,
-            rso_pool_size=200,
-            max_rso_age_days=30,
-            max_obs_range_km=1000,
-            range_norm_km=8000, #observed candidate ranges reach about 7309 km
-            rel_speed_norm_km_s=15,
-            risk_distance_scale_km=2500
+            env_config
         )
         check_env(env, skip_render_check=True)
 
-        obs_values = []
+        frames = []
 
         obs, info = env.reset()
-        obs_values.append(obs)
-        print("Initial Observation:", obs)
-        print("Initial candidates:", info["candidate_names"])
-        print("Initial candidate ranges (km):", info["candidate_ranges_km"])
-
+        frames.append(env.render())
+        
         assert obs.shape == env.observation_space.shape, "Observation shape mismatch with observation space."
         assert env.action_space.n == env.K + 1, "Action space size mismatch. Expected 6 actions (0-5)."
 
-        for _ in range(300):
+        for _ in range(10):
             action = env.action_space.sample()  # Sample a random action (for demonstration)
             obs, reward, terminated, truncated, info = env.step(action)
-            print("time:", info["time_utc"])
-            print("ranges:", np.round(info["candidate_ranges_km"], 1))
-            print("visible:", info["candidate_visible"])
-            print("risk:", np.round(info["candidate_risk_scores"], 6))
             print("reward:", reward)
-            print("action:", action)
-            print("Observation:", obs)
+            #print("action:", action)
+            #print("Observation:", obs)
             print("Selected candidate:", info["selected_object_name"])
-            obs_values.append(obs)
+
+            frames.append(env.render())
 
             if terminated or truncated:
                 break
-        
-        obs_values = np.array(obs_values)
+        env.close()
 
-        print("obs min:", np.min(obs_values, axis=0))
-        print("obs max:", np.max(obs_values, axis=0))
-        print("fraction clipped at +1:", np.mean(obs_values >= 0.999))
-        print("fraction clipped at -1:", np.mean(obs_values <= -0.999))
+        # Save the frames as a GIF
+        gif_filename = "single_sat_env_simulation.gif"
+        imageio.mimsave(gif_filename, frames, fps=2)
+        print(f"Simulation GIF saved as {gif_filename}")
+        
     else:
         print("Goodbye!")

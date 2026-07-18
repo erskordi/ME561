@@ -1,12 +1,12 @@
 import numpy as np
 
-def no_op_policy(obs, info):
+def no_op_policy():
     """
     A simple policy that always chooses the no-op action (0).
     """
     return 0
 
-def random_policy(obs, info, env):
+def random_policy(env):
     """
     A simple policy that randomly selects an action from the available actions.
     """
